@@ -392,6 +392,7 @@ class ModelPatcher:
         self.forced_hooks: Optional[comfy.hooks.HookGroup] = None  # NOTE: only used for CLIP at this time
         self.is_clip = False
         self.hook_mode = comfy.hooks.EnumHookMode.MaxSpeed
+        self._hook_async_offload_disabled = False
 
         self.cached_patcher_init: tuple[Callable, tuple] | tuple[Callable, tuple, int] | None = None
         self.is_multigpu_base_clone = False
@@ -1631,12 +1632,25 @@ class ModelPatcher:
                     original_weights = None
                     if len(relevant_patches) > 0:
                         original_weights = self.get_key_patches()
+                    patch_keys = []
                     for key in relevant_patches:
                         if key not in model_sd_keys:
                             logging.warning(f"Cached hook would not patch. Key does not exist in model: {key}")
                             continue
+                        patch_keys.append(key)
+                    cache_entries = None
+                    if memory_counter is not None and patch_keys:
+                        cache_required = 0
+                        for key in patch_keys:
+                            weight, _, _ = get_key_weight(self.model, key)
+                            cache_required += weight.nelement() * weight.element_size() * 2
+                        if memory_counter.is_useable(cache_required):
+                            cache_entries = {}
+                    for key in patch_keys:
                         self.patch_hook_weight_to_device(hooks=hooks, combined_patches=relevant_patches, key=key, original_weights=original_weights,
-                                                            memory_counter=memory_counter)
+                                                            memory_counter=memory_counter, cache_entries=cache_entries)
+                    if cache_entries is not None and len(cache_entries) == len(patch_keys):
+                        self.cached_hook_patches[hooks] = cache_entries
             else:
                 self.unpatch_hooks()
             self.current_hooks = hooks
@@ -1644,6 +1658,8 @@ class ModelPatcher:
     def patch_cached_hook_weights(self, cached_weights: dict, key: str, memory_counter: MemoryCounter):
         weight, set_func, _ = get_key_weight(self.model, key)
         inplace_update = set_func is None
+        if inplace_update:
+            self._disable_async_offload_for_hooks()
         if key not in self.hook_backup:
             target_device = self.offload_device
             if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
@@ -1661,16 +1677,33 @@ class ModelPatcher:
         self.cached_hook_patches.clear()
         self.patch_hooks(None)
 
-    def patch_hook_weight_to_device(self, hooks: comfy.hooks.HookGroup, combined_patches: dict, key: str, original_weights: dict, memory_counter: MemoryCounter):
+    def _disable_async_offload_for_hooks(self):
+        if self._hook_async_offload_disabled:
+            return
+        # Hook writeback changes prepared weight storage after model loading.
+        # Keep this delegate's transfers synchronous and honor its model dtypes.
+        for module in self.model.modules():
+            if hasattr(module, "comfy_cast_weights"):
+                module.comfy_disable_async_offload = True
+                for param_name, param in module.named_parameters(recurse=False):
+                    model_dtype = getattr(module, param_name + "_comfy_model_dtype", None)
+                    if model_dtype is not None and param.dtype != model_dtype:
+                        module.comfy_cast_weights = True
+        self._hook_async_offload_disabled = True
+
+    def patch_hook_weight_to_device(self, hooks: comfy.hooks.HookGroup, combined_patches: dict, key: str, original_weights: dict,
+                                    memory_counter: MemoryCounter, cache_entries: dict=None):
         if key not in combined_patches:
             return
 
         weight, set_func, convert_func = get_key_weight(self.model, key)
         weight: torch.Tensor
         inplace_update = set_func is None
+        if inplace_update:
+            self._disable_async_offload_for_hooks()
         if key not in self.hook_backup:
             target_device = self.offload_device
-            if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
+            if cache_entries is not None:
                 used = memory_counter.use(weight)
                 if used:
                     target_device = weight.device
@@ -1690,14 +1723,12 @@ class ModelPatcher:
         else:
             out_weight = set_func(out_weight, inplace_update=False, seed=comfy.utils.string_to_seed(key), return_weight=True)
             comfy.utils.set_attr_param(self.model, key, out_weight)
-        if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
-            # TODO: disable caching if not enough system RAM to do so
+        if cache_entries is not None:
             target_device = self.offload_device
             used = memory_counter.use(weight)
             if used:
                 target_device = weight.device
-            self.cached_hook_patches.setdefault(hooks, {})
-            self.cached_hook_patches[hooks][key] = (out_weight.to(device=target_device, copy=False), weight.device)
+                cache_entries[key] = (out_weight.to(device=target_device, copy=False), weight.device)
         del temp_weight
         del out_weight
         del weight
@@ -2165,7 +2196,8 @@ class ModelPatcherDynamic(ModelPatcher):
     def patch_cached_hook_weights(self, cached_weights: dict, key: str, memory_counter: MemoryCounter):
         assert False #Should be unreachable - we dont ever cache in the new implementation
 
-    def patch_hook_weight_to_device(self, hooks: comfy.hooks.HookGroup, combined_patches: dict, key: str, original_weights: dict, memory_counter: MemoryCounter):
+    def patch_hook_weight_to_device(self, hooks: comfy.hooks.HookGroup, combined_patches: dict, key: str, original_weights: dict,
+                                    memory_counter: MemoryCounter, cache_entries: dict=None):
         if key not in combined_patches:
             return
 
